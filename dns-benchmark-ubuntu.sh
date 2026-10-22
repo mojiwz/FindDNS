@@ -1,30 +1,31 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Project: AKDNS System Manager
+# Project: AKDNS System Manager (v2.2.0 - Zero-Disk-Bloat Edition)
 # Description: Enterprise-grade DNS & MTU Management, Benchmarking, and
 #              Diagnostics Tool for Ubuntu Server (20.04 / 22.04 / 24.04+)
 # Safety Rule: Strictly OS-level networking. Zero touch on Xray/Marzban configs.
+# Disk Policy: No log files, no CSV files written to disk. Auto-pruned backups.
 # ==============================================================================
 
 umask 0077
 export LC_ALL=C
 
 # --- Global Constants & Directories ---
-readonly VERSION="2.1.0-enterprise"
+readonly VERSION="2.2.0-lean"
 readonly SCRIPT_NAME="akdns-manager.sh"
 readonly BASE_DIR="/var/lib/akdns"
 readonly BACKUP_DIR="${BASE_DIR}/backups"
-readonly LOG_DIR="/var/log/akdns"
-readonly LOG_FILE="${LOG_DIR}/akdns.log"
-readonly CSV_DIR="${LOG_DIR}/benchmarks"
 readonly STATE_FILE="${BASE_DIR}/last_operation.state"
 readonly RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
 readonly RESOLVED_DROPIN_FILE="${RESOLVED_DROPIN_DIR}/90-akdns.conf"
+readonly MAX_BACKUPS=3
+
+# --- In-Memory Session Log (RAM Only - Zero Disk Usage) ---
+declare -a SESSION_LOGS=()
 
 # --- Runtime Flags ---
 DRY_RUN=0
 ASSUME_YES=0
- Rollback_Timer_Seconds=30
 
 # --- Colors & Formatting ---
 if [[ -t 1 ]]; then
@@ -39,7 +40,7 @@ else
     readonly C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_BOLD=""
 fi
 
-# --- System State Variables (Populated by detect_system) ---
+# --- System State Variables ---
 SYS_DISTRO_NAME="unknown"
 SYS_DISTRO_VER="unknown"
 SYS_DISTRO_ID="unknown"
@@ -69,7 +70,6 @@ DNS_DHCP_SERVERS="not available"
 DNS_FALLBACK_SERVERS="unknown"
 
 # --- Public DNS Resolvers Database ---
-# Format: "Provider|IPv4_Primary|IPv4_Secondary|Privacy_Tag|Filtering_Tag"
 readonly PUBLIC_RESOLVERS=(
     "Cloudflare|1.1.1.1|1.0.0.1|high|none"
     "Google|8.8.8.8|8.8.4.4|standard|none"
@@ -88,15 +88,17 @@ readonly BENCHMARK_DOMAINS=(
 )
 
 # ==============================================================================
-# Section 1: Core Utilities, Logging & Safety Guards
+# Section 1: Core Utilities, In-Memory Logging & Safety Guards
 # ==============================================================================
 
 init_storage() {
     if [[ $EUID -eq 0 ]]; then
-        mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$CSV_DIR" 2>/dev/null
-        chmod 700 "$BASE_DIR" "$BACKUP_DIR" "$LOG_DIR" 2>/dev/null
-        touch "$LOG_FILE" 2>/dev/null
-        chmod 600 "$LOG_FILE" 2>/dev/null
+        mkdir -p "$BACKUP_DIR" 2>/dev/null
+        chmod 700 "$BASE_DIR" "$BACKUP_DIR" 2>/dev/null
+        # Clean up any legacy log/CSV directories from older script versions to free disk space
+        if [[ -d "/var/log/akdns" ]]; then
+            rm -rf "/var/log/akdns" 2>/dev/null
+        fi
     fi
 }
 
@@ -106,8 +108,10 @@ log_msg() {
     local msg="$*"
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    if [[ -w "$LOG_FILE" ]]; then
-        printf "[%s] [%s] %s\n" "$ts" "$level" "$msg" >> "$LOG_FILE"
+    SESSION_LOGS+=("[${ts}] [${level}] ${msg}")
+    # Keep RAM array capped at 100 entries
+    if (( ${#SESSION_LOGS[@]} > 100 )); then
+        SESSION_LOGS=("${SESSION_LOGS[@]:1}")
     fi
 }
 
@@ -149,12 +153,29 @@ require_root() {
     return 0
 }
 
-check_Not_Dry_Run() {
+check_not_dry_run() {
     if [[ $DRY_RUN -eq 1 ]]; then
         print_warn "DRY-RUN MODE ACTIVE: No actual changes will be written to the system."
         return 1
     fi
     return 0
+}
+
+prune_old_backups() {
+    [[ ! -d "$BACKUP_DIR" ]] && return 0
+    local -a b_dirs=()
+    while IFS= read -r -d '' d; do
+        b_dirs+=("$d")
+    done < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
+
+    local total=${#b_dirs[@]}
+    if (( total > MAX_BACKUPS )); then
+        local to_delete=$(( total - MAX_BACKUPS ))
+        local i
+        for (( i=0; i<to_delete; i++ )); do
+            rm -rf "${b_dirs[$i]}" 2>/dev/null
+        done
+    fi
 }
 
 # ==============================================================================
@@ -171,23 +192,19 @@ is_valid_ipv4() {
     local o
     for o in "${octets[@]}"; do
         [[ "$o" =~ ^[0-9]+$ ]] || return 1
-        # Prevent octal interpretation
         if [[ ${#o} -gt 1 && "${o:0:1}" == "0" ]]; then return 1; fi
         (( o >= 0 && o <= 255 )) || return 1
     done
-    # Reject 0.0.0.0 and 255.255.255.255 as DNS servers
     [[ "$ip" == "0.0.0.0" || "$ip" == "255.255.255.255" ]] && return 1
     return 0
 }
 
 is_valid_ipv6() {
     local ip="$1"
-    # Use python3 ipaddress module if available for strict RFC validation
     if command -v python3 >/dev/null 2>&1; then
         python3 -c "import ipaddress, sys; ip = ipaddress.IPv6Address(sys.argv[1]); sys.exit(0 if not (ip.is_unspecified or ip.is_multicast) else 1)" "$ip" 2>/dev/null
         return $?
     fi
-    # Fallback regex check for IPv6
     [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]] && [[ "$ip" != "::" ]]
 }
 
@@ -228,11 +245,11 @@ check_dependencies() {
                 apt-get update -y && apt-get install -y "${missing_pkgs[@]}"
                 return $?
             else
-                print_warn "Proceeding without installing missing packages. Some features may be restricted."
+                print_warn "Proceeding without installing missing packages."
                 return 1
             fi
         else
-            print_warn "Run as root to allow automatic installation of: ${missing_pkgs[*]}"
+            print_warn "Run as root to allow installation of: ${missing_pkgs[*]}"
             return 1
         fi
     fi
@@ -246,7 +263,6 @@ check_dependencies() {
 detect_system() {
     [[ $EUID -eq 0 ]] && SYS_IS_ROOT=1 || SYS_IS_ROOT=0
 
-    # 1. Distro Detection
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         source /etc/os-release
@@ -255,7 +271,6 @@ detect_system() {
         SYS_DISTRO_ID="${ID:-ubuntu}"
     fi
 
-    # 2. Init System Detection
     if [[ -d /run/systemd/system ]]; then
         SYS_INIT="systemd"
     elif [[ -f /sbin/init && "$(readlink -f /sbin/init 2>/dev/null)" == *systemd* ]]; then
@@ -264,7 +279,6 @@ detect_system() {
         SYS_INIT="other/unknown"
     fi
 
-    # 3. Primary Interface, Gateway, IPv4, IPv6, Current MTU
     if command -v ip >/dev/null 2>&1; then
         NET_PRIMARY_IFACE="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
         if [[ -z "$NET_PRIMARY_IFACE" ]]; then
@@ -287,7 +301,6 @@ detect_system() {
         fi
     fi
 
-    # 4. /etc/resolv.conf Inspection
     if [[ -L /etc/resolv.conf ]]; then
         DNS_RESOLV_TARGET="$(readlink -f /etc/resolv.conf 2>/dev/null || readlink /etc/resolv.conf 2>/dev/null)"
         DNS_RESOLV_TYPE="symlink -> ${DNS_RESOLV_TARGET}"
@@ -307,7 +320,6 @@ detect_system() {
         DNS_RESOLV_TYPE="missing"
     fi
 
-    # 5. Service States (systemd-resolved, NetworkManager, systemd-networkd)
     local resolved_active=0 nm_active=0 networkd_active=0
     if [[ "$SYS_INIT" == "systemd" ]]; then
         systemctl is-active --quiet systemd-resolved 2>/dev/null && resolved_active=1
@@ -315,7 +327,6 @@ detect_system() {
         systemctl is-active --quiet systemd-networkd 2>/dev/null && networkd_active=1
     fi
 
-    # 6. Runtime DNS Backend Determination
     if [[ $resolved_active -eq 1 && "$DNS_RESOLV_TARGET" == *"/systemd/resolve/"* ]]; then
         DNS_RUNTIME_BACKEND="systemd-resolved"
     elif [[ $nm_active -eq 1 && "$DNS_RESOLV_TYPE" == *"NetworkManager"* ]]; then
@@ -328,7 +339,6 @@ detect_system() {
         DNS_RUNTIME_BACKEND="unknown"
     fi
 
-    # 7. Netplan & Cloud-Init Inspection (Persistent Backend)
     DNS_NETPLAN_MAIN_FILE="none"
     DNS_NETPLAN_RENDERER="unknown"
     DNS_CLOUD_INIT_ACTIVE="no"
@@ -350,7 +360,6 @@ detect_system() {
                 fi
             done
 
-            # Extract renderer via Python YAML parser if available
             if command -v python3 >/dev/null 2>&1; then
                 DNS_NETPLAN_RENDERER="$(python3 -c '
 import sys, yaml
@@ -389,7 +398,6 @@ except Exception:
         DNS_PERSISTENT_BACKEND="unknown"
     fi
 
-    # 8. Extract Active, Per-Link, DHCP, Fallback, and Persistent DNS + Persistent MTU
     extract_detailed_dns_and_mtu
 }
 
@@ -401,7 +409,6 @@ extract_detailed_dns_and_mtu() {
     DNS_PERSISTENT_CFG="not configured"
     NET_PERSISTENT_MTU="not configured"
 
-    # A) Active & Per-Link & Fallback from systemd-resolved
     if [[ "$DNS_RUNTIME_BACKEND" == "systemd-resolved" ]] && command -v resolvectl >/dev/null 2>&1; then
         DNS_CURRENT_ACTIVE="$(resolvectl dns 2>/dev/null | awk -F': ' 'NF>1 && $2!="" {print $2}' | tr '\n' ' ' | xargs)"
         if [[ "$NET_PRIMARY_IFACE" != "unknown" ]]; then
@@ -412,7 +419,6 @@ extract_detailed_dns_and_mtu() {
         [[ -z "$DNS_FALLBACK_SERVERS" ]] && DNS_FALLBACK_SERVERS="none"
     fi
 
-    # Fallback reading from /etc/resolv.conf if still unknown
     if [[ -z "$DNS_CURRENT_ACTIVE" || "$DNS_CURRENT_ACTIVE" == "unknown" ]]; then
         if [[ -f /etc/resolv.conf ]]; then
             DNS_CURRENT_ACTIVE="$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ' ' -)"
@@ -420,7 +426,6 @@ extract_detailed_dns_and_mtu() {
         fi
     fi
 
-    # B) DHCP DNS extraction
     if [[ "$NET_PRIMARY_IFACE" != "unknown" ]]; then
         local ifindex
         ifindex="$(cat "/sys/class/net/${NET_PRIMARY_IFACE}/ifindex" 2>/dev/null)"
@@ -432,7 +437,6 @@ extract_detailed_dns_and_mtu() {
         [[ -z "$DNS_DHCP_SERVERS" ]] && DNS_DHCP_SERVERS="not available"
     fi
 
-    # C) Persistent DNS & MTU from Netplan / Drop-in / NM
     local np_dns="" np_mtu=""
     if [[ "$DNS_NETPLAN_MAIN_FILE" != "none" && -f "$DNS_NETPLAN_MAIN_FILE" ]] && command -v python3 >/dev/null 2>&1; then
         read -r np_dns np_mtu < <(python3 -c '
@@ -526,14 +530,14 @@ show_system_status() {
     printf "Current MTU (runtime):   %s\n" "$NET_CURRENT_MTU"
     printf "Persistent MTU:          %s\n" "$NET_PERSISTENT_MTU"
     printf "resolv.conf target:      %s\n" "$DNS_RESOLV_TYPE"
-    printf "Backup count:            %s\n" "$b_count"
+    printf "Backup count:            %s (Max Auto-Cap: %s)\n" "$b_count" "$MAX_BACKUPS"
     printf "Last backup:             %s\n" "$b_last"
     printf "Last operation:          %s\n" "$last_op"
     printf "${C_CYAN}=====================================================${C_RESET}\n\n"
 }
 
 # ==============================================================================
-# Section 5: Backup & Restore Engine
+# Section 5: Lightweight Auto-Pruned Backup & Restore Engine
 # ==============================================================================
 
 create_backup() {
@@ -545,43 +549,28 @@ create_backup() {
     ts="$(date '+%Y%m%d_%H%M%S')"
     local target_dir="${BACKUP_DIR}/${ts}_${op_reason// /_}"
 
-    if ! check_Not_Dry_Run; then
+    if ! check_not_dry_run; then
         print_info "[DRY-RUN] Would create backup in: ${target_dir}"
         return 0
     fi
 
     mkdir -p "${target_dir}/netplan" "${target_dir}/resolved.conf.d" "${target_dir}/nm_connections" "${target_dir}/etc" || {
-        print_err "Failed to create backup directory structure at ${target_dir}"
+        print_err "Failed to create backup directory at ${target_dir}"
         return 1
     }
     chmod 700 "$target_dir"
 
-    # 1. Backup Netplan YAML files with permissions preserved
-    if [[ -d /etc/netplan ]]; then
-        cp -a /etc/netplan/. "${target_dir}/netplan/" 2>/dev/null
-    fi
+    [[ -d /etc/netplan ]] && cp -a /etc/netplan/. "${target_dir}/netplan/" 2>/dev/null
+    [[ -f /etc/systemd/resolved.conf ]] && cp -a /etc/systemd/resolved.conf "${target_dir}/etc/resolved.conf" 2>/dev/null
+    [[ -d /etc/systemd/resolved.conf.d ]] && cp -a /etc/systemd/resolved.conf.d/. "${target_dir}/resolved.conf.d/" 2>/dev/null
+    [[ -d /etc/NetworkManager/system-connections ]] && cp -a /etc/NetworkManager/system-connections/. "${target_dir}/nm_connections/" 2>/dev/null
 
-    # 2. Backup systemd-resolved configuration & drop-ins
-    if [[ -f /etc/systemd/resolved.conf ]]; then
-        cp -a /etc/systemd/resolved.conf "${target_dir}/etc/resolved.conf" 2>/dev/null
-    fi
-    if [[ -d /etc/systemd/resolved.conf.d ]]; then
-        cp -a /etc/systemd/resolved.conf.d/. "${target_dir}/resolved.conf.d/" 2>/dev/null
-    fi
-
-    # 3. Backup NetworkManager system connections
-    if [[ -d /etc/NetworkManager/system-connections ]]; then
-        cp -a /etc/NetworkManager/system-connections/. "${target_dir}/nm_connections/" 2>/dev/null
-    fi
-
-    # 4. Backup /etc/resolv.conf state (Symlink target vs Regular file)
     if [[ -L /etc/resolv.conf ]]; then
         readlink /etc/resolv.conf > "${target_dir}/resolv_symlink.target"
     elif [[ -f /etc/resolv.conf ]]; then
         cp -a /etc/resolv.conf "${target_dir}/etc/resolv.conf.file"
     fi
 
-    # 5. Save Metadata & Runtime State
     cat <<EOF > "${target_dir}/metadata.env"
 BACKUP_TIMESTAMP="${ts}"
 BACKUP_REASON="${op_reason}"
@@ -595,7 +584,10 @@ PER_LINK_DNS="${DNS_PER_LINK}"
 EOF
     chmod 600 "${target_dir}/metadata.env"
 
-    print_ok "Backup successfully created: $(basename "$target_dir")"
+    # Automatically delete older backups beyond MAX_BACKUPS (3) to prevent disk usage growth
+    prune_old_backups
+
+    print_ok "Backup snapshot created: $(basename "$target_dir") (Auto-capped at ${MAX_BACKUPS} snapshots)"
     record_operation "Backup (${op_reason})" "SUCCESS"
     echo "$target_dir"
     return 0
@@ -603,7 +595,7 @@ EOF
 
 list_backups() {
     if [[ ! -d "$BACKUP_DIR" ]]; then
-        print_info "No backup directory found at ${BACKUP_DIR}."
+        print_info "No backup directory found."
         return 0
     fi
 
@@ -617,11 +609,10 @@ list_backups() {
         return 0
     fi
 
-    printf "\n${C_BOLD}%-4s %-22s %-20s %-10s %-10s %-25s${C_RESET}\n" "ID" "Timestamp" "Reason" "Iface" "MTU" "Active DNS (at backup)"
-    printf "%s\n" "------------------------------------------------------------------------------------------------"
+    printf "\n${C_BOLD}%-4s %-20s %-20s %-10s %-10s %-25s${C_RESET}\n" "ID" "Timestamp" "Reason" "Iface" "MTU" "Active DNS (at backup)"
+    printf "%s\n" "----------------------------------------------------------------------------------------------"
 
-    local idx=1
-    local d
+    local idx=1 d
     for d in "${b_dirs[@]}"; do
         local b_ts="unknown" b_reason="unknown" b_if="?" b_mtu="?" b_dns="?"
         if [[ -f "${d}/metadata.env" ]]; then
@@ -633,7 +624,7 @@ list_backups() {
         else
             b_ts="$(basename "$d")"
         fi
-        printf "%-4d %-22s %-20s %-10s %-10s %-25s\n" "$idx" "$b_ts" "${b_reason:0:19}" "$b_if" "$b_mtu" "${b_dns:0:24}"
+        printf "%-4d %-20s %-20s %-10s %-10s %-25s\n" "$idx" "$b_ts" "${b_reason:0:19}" "$b_if" "$b_mtu" "${b_dns:0:24}"
         ((idx++))
     done
     printf "\n"
@@ -659,7 +650,6 @@ compare_with_backup() {
     detect_system
     printf "\n${C_CYAN}=== Comparing Current Configuration with Backup: $(basename "$target_dir") ===${C_RESET}\n"
     if [[ -f "${target_dir}/metadata.env" ]]; then
-        printf "${C_BOLD}[Backup Metadata vs Current State]${C_RESET}\n"
         local b_mtu b_dns
         b_mtu="$(awk -F'"' '/^RUNTIME_MTU=/ {print $2}' "${target_dir}/metadata.env")"
         b_dns="$(awk -F'"' '/^ACTIVE_DNS=/ {print $2}' "${target_dir}/metadata.env")"
@@ -713,18 +703,10 @@ restore_backup() {
         return 1
     fi
 
-    check_Not_Dry_Run || return 0
-
-    # Safety pre-restore backup
-    print_info "Creating safety snapshot of current state before restoring..."
-    create_backup "pre_restore_snapshot" >/dev/null || {
-        print_err "Pre-restore backup failed. Aborting restore for safety."
-        return 1
-    }
+    check_not_dry_run || return 0
 
     local restore_errors=0
 
-    # 1. Restore Netplan files (Only overwrite/restore backed-up files, do not blindly delete unrelated files)
     if [[ -d "${target_dir}/netplan" ]]; then
         cp -a "${target_dir}/netplan/." /etc/netplan/ 2>/dev/null || ((restore_errors++))
         if command -v netplan >/dev/null 2>&1; then
@@ -737,16 +719,13 @@ restore_backup() {
         fi
     fi
 
-    # 2. Restore systemd-resolved drop-ins
     if [[ -d "${target_dir}/resolved.conf.d" ]]; then
-        # Remove our managed drop-in if it didn't exist in backup
         if [[ ! -f "${target_dir}/resolved.conf.d/90-akdns.conf" && -f "$RESOLVED_DROPIN_FILE" ]]; then
             rm -f "$RESOLVED_DROPIN_FILE"
         fi
         cp -a "${target_dir}/resolved.conf.d/." /etc/systemd/resolved.conf.d/ 2>/dev/null || ((restore_errors++))
     fi
 
-    # 3. Restore /etc/resolv.conf symlink or file
     if [[ -f "${target_dir}/resolv_symlink.target" ]]; then
         local sym_t
         sym_t="$(cat "${target_dir}/resolv_symlink.target")"
@@ -756,12 +735,10 @@ restore_backup() {
         cp -a "${target_dir}/etc/resolv.conf.file" /etc/resolv.conf 2>/dev/null || ((restore_errors++))
     fi
 
-    # 4. Restart systemd-resolved if active
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         systemctl restart systemd-resolved 2>/dev/null || ((restore_errors++))
     fi
 
-    # 5. Restore Runtime MTU
     local b_if b_mtu
     b_if="$(awk -F'"' '/^PRIMARY_IFACE=/ {print $2}' "${target_dir}/metadata.env")"
     b_mtu="$(awk -F'"' '/^RUNTIME_MTU=/ {print $2}' "${target_dir}/metadata.env")"
@@ -781,7 +758,7 @@ restore_backup() {
 }
 
 # ==============================================================================
-# Section 6: DNS Benchmark Engine (True Dig Timing, Cold/Warm Cache, No Fake MS)
+# Section 6: DNS Benchmark Engine (Fixed Dig Option Order & Zero Disk Writes)
 # ==============================================================================
 
 LAST_BENCHMARK_BEST_PROVIDER=""
@@ -839,15 +816,7 @@ run_dns_benchmark() {
     detect_system
     [[ "$NET_IPV6" != "not available" ]] && test_ipv6=1
 
-    local ts
-    ts="$(date '+%Y%m%d_%H%M%S')"
-    local csv_file="${CSV_DIR}/benchmark_${ts}.csv"
-    if [[ -w "$CSV_DIR" ]]; then
-        echo "Provider,IP,Privacy,Filtering,Total_Queries,Success_Count,Success_Rate,Timeouts,Servfail_Empty,Min_ms,Avg_ms,Median_ms,Max_ms,Jitter_ms,Cold_Avg_ms,Warm_Avg_ms,Score,Status" > "$csv_file"
-    fi
-
     local -a all_entries=("${PUBLIC_RESOLVERS[@]}" "${custom_resolvers[@]}")
-    local -a summary_rows=()
 
     LAST_BENCHMARK_BEST_PROVIDER=""
     LAST_BENCHMARK_BEST_IPV4_1=""
@@ -863,7 +832,6 @@ run_dns_benchmark() {
     for entry in "${all_entries[@]}"; do
         IFS='|' read -r prov ip1 ip2 priv filt <<< "$entry"
 
-        # Apply user preference filters
         if [[ "$pref_privacy" != "any" && "$priv" != "$pref_privacy" && "$priv" != "custom" ]]; then
             continue
         fi
@@ -879,7 +847,6 @@ run_dns_benchmark() {
         local timeout_q=0
         local bad_resp_q=0
 
-        # Warm/Cold test using unique uncached query vs standard domains
         local r d qtype
         for (( r=1; r<=rounds; r++ )); do
             for d in "${BENCHMARK_DOMAINS[@]}"; do
@@ -887,21 +854,34 @@ run_dns_benchmark() {
                     ((total_q++))
                     local dig_out=""
                     local dig_rc=0
-                    dig_out="$(dig @"${ip1}" "$d" "$qtype" +tries="$retries" +time="$timeout_sec" +stats +noall +answer +comments 2>&1)" || dig_rc=$?
+                    # CRITICAL FIX: '+noall' MUST come BEFORE '+answer +comments +stats'
+                    # Otherwise '+noall' wipes out the '+stats' section (Query time)!
+                    dig_out="$(dig @"${ip1}" "$d" "$qtype" +tries="$retries" +time="$timeout_sec" +noall +answer +comments +stats 2>&1)" || dig_rc=$?
 
-                    if [[ $dig_rc -ne 0 ]] || grep -q "connection timed out" <<< "$dig_out"; then
+                    if [[ $dig_rc -eq 9 ]] || grep -qiE "connection timed out|communications error|network unreachable|no servers could be reached" <<< "$dig_out"; then
                         ((timeout_q++))
+                        continue
+                    elif [[ $dig_rc -ne 0 ]]; then
+                        ((bad_resp_q++))
                         continue
                     fi
 
-                    local r_status
-                    r_status="$(awk -F'status: ' '/flags:.*status:/ {split($2,a,","); print a[1]; exit}' <<< "$dig_out")"
-                    local q_time
-                    q_time="$(awk '/Query time:/ {print $(NF-1); exit}' <<< "$dig_out")"
-                    local ans_count
-                    ans_count="$(awk '/ANSWER: / {for(i=1;i<=NF;i++) if($i=="ANSWER:") {gsub(",","",$(i+1)); print $(i+1); exit}}' <<< "$dig_out")"
+                    local r_status=""
+                    if [[ "$dig_out" =~ status:[[:space:]]*([A-Z]+), ]]; then
+                        r_status="${BASH_REMATCH[1]}"
+                    fi
 
-                    if [[ "$r_status" == "NOERROR" && "${ans_count:-0}" -gt 0 && "$q_time" =~ ^[0-9]+$ ]]; then
+                    local q_time=""
+                    if [[ "$dig_out" =~ Query[[:space:]]+time:[[:space:]]*([0-9]+)[[:space:]]*msec ]]; then
+                        q_time="${BASH_REMATCH[1]}"
+                    fi
+
+                    local ans_count=0
+                    if [[ "$dig_out" =~ ANSWER:[[:space:]]*([0-9]+) ]]; then
+                        ans_count="${BASH_REMATCH[1]}"
+                    fi
+
+                    if [[ "$r_status" == "NOERROR" && "$ans_count" -gt 0 && "$q_time" =~ ^[0-9]+$ ]]; then
                         ((success_q++))
                         valid_times+=("$q_time")
                         if (( r == 1 )); then
@@ -910,14 +890,12 @@ run_dns_benchmark() {
                             warm_times+=("$q_time")
                         fi
                     else
-                        # SERVFAIL, NXDOMAIN on valid root domain, empty answer, or unparseable time
                         ((bad_resp_q++))
                     fi
                 done
             done
         done
 
-        # Compute statistics strictly from valid_times (NO fake 999999 ms values!)
         local s_rate=0
         (( total_q > 0 )) && s_rate=$(( (success_q * 100) / total_q ))
 
@@ -943,7 +921,6 @@ run_dns_benchmark() {
                 med_ms=$(( (sorted[cnt/2 - 1] + sorted[cnt/2]) / 2 ))
             fi
 
-            # Mean Absolute Deviation (Jitter)
             local dev_sum=0 diff_val
             for t in "${sorted[@]}"; do
                 diff_val=$(( t - avg_ms ))
@@ -963,11 +940,8 @@ run_dns_benchmark() {
                 warm_avg=$(( w_sum / ${#warm_times[@]} ))
             fi
 
-            # Multi-factor Eligibility & Ranking Score (Lower is better):
-            # Must have >= 75% success rate and at least 4 valid responses
             if (( s_rate >= 75 && cnt >= 4 )); then
                 verdict="HEALTHY"
-                # Score combines Median (weight 50%), Avg (20%), Jitter (30%), + heavy penalty for any packet loss/bad answer
                 local loss_penalty=$(( (100 - s_rate) * 15 ))
                 score=$(( (med_ms * 5) + (avg_ms * 2) + (jitter_ms * 3) + loss_penalty ))
                 if (( jitter_ms > avg_ms && avg_ms > 20 )); then
@@ -990,10 +964,6 @@ run_dns_benchmark() {
             "${prov:0:14}" "$ip1" "${s_rate}%" "$timeout_q" \
             "${min_ms}" "${med_ms}" "${avg_ms}" "${jitter_ms}" \
             "${cold_avg}/${warm_avg}" "$verdict"
-
-        if [[ -w "$CSV_DIR" ]]; then
-            echo "${prov},${ip1},${priv},${filt},${total_q},${success_q},${s_rate}%,${timeout_q},${bad_resp_q},${min_ms},${avg_ms},${med_ms},${max_ms},${jitter_ms},${cold_avg},${warm_avg},${score},${verdict}" >> "$csv_file"
-        fi
     done
 
     printf "%s\n" "------------------------------------------------------------------------------------------------------"
@@ -1003,7 +973,6 @@ run_dns_benchmark() {
     else
         printf "${C_RED}[ALERT]${C_RESET} No DNS resolver met the minimum reliability threshold (>=75%% success). No automatic DNS change is advised.\n"
     fi
-    [[ -f "$csv_file" ]] && print_info "Detailed CSV report saved to: ${csv_file}"
     record_operation "DNS Benchmark" "SUCCESS"
     return 0
 }
@@ -1032,8 +1001,8 @@ verify_dns_resolution() {
 update_netplan_yaml_safely() {
     local yaml_file="$1"
     local iface="$2"
-    local mode="$3" # "dns" or "mtu"
-    local value="$4" # space-separated DNS IPs or single MTU integer
+    local mode="$3"
+    local value="$4"
     local out_tmp="$5"
 
     python3 - "$yaml_file" "$iface" "$mode" "$value" "$out_tmp" << 'PYEOF'
@@ -1080,7 +1049,7 @@ apply_dns_servers() {
     require_root || return 1
     local dns_list="$*"
     if [[ -z "$dns_list" ]]; then
-        print_err "No DNS servers provided to apply_dns_servers."
+        print_err "No DNS servers provided."
         return 1
     fi
 
@@ -1094,7 +1063,6 @@ apply_dns_servers() {
 
     if [[ "$DNS_CLOUD_INIT_ACTIVE" == yes* ]]; then
         print_warn "Cloud-init network management detected: ${DNS_CLOUD_INIT_ACTIVE}"
-        print_warn "Note: Cloud-init may overwrite Netplan changes across reboots unless disabled in /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
     fi
 
     printf "\n${C_CYAN}--- Proposed DNS Configuration ---${C_RESET}\n"
@@ -1103,7 +1071,6 @@ apply_dns_servers() {
     printf "Persistent Backend:    %s\n" "$DNS_PERSISTENT_BACKEND"
     printf "Target Interface:      %s\n" "$NET_PRIMARY_IFACE"
 
-    # Prepare staging files & show diff before applying
     local tmp_dropin
     tmp_dropin="$(mktemp /tmp/akdns_resolved.XXXXXX)"
     cat <<EOF > "$tmp_dropin"
@@ -1121,7 +1088,7 @@ EOF
             printf "\n${C_BOLD}[Diff for %s]${C_RESET}\n" "$DNS_NETPLAN_MAIN_FILE"
             diff -u "$DNS_NETPLAN_MAIN_FILE" "$tmp_netplan" || true
         else
-            print_warn "Could not safely locate interface '${NET_PRIMARY_IFACE}' inside ${DNS_NETPLAN_MAIN_FILE}. Will skip Netplan YAML edit and use backend-native drop-in."
+            print_warn "Could not safely locate interface '${NET_PRIMARY_IFACE}' inside ${DNS_NETPLAN_MAIN_FILE}. Skipping YAML edit."
             rm -f "$tmp_netplan"
         fi
     fi
@@ -1140,12 +1107,11 @@ EOF
         return 1
     fi
 
-    if ! check_Not_Dry_Run; then
+    if ! check_not_dry_run; then
         rm -f "$tmp_dropin" "$tmp_netplan"
         return 0
     fi
 
-    # Mandatory Backup before any change
     local backup_path
     backup_path="$(create_backup "pre_dns_change" | tail -n 1)"
     if [[ -z "$backup_path" || ! -d "$backup_path" ]]; then
@@ -1156,7 +1122,6 @@ EOF
 
     local apply_err=0
 
-    # 1. Apply to Netplan if validated
     if [[ $update_np -eq 1 && -f "$tmp_netplan" ]]; then
         cp -f "$tmp_netplan" "$DNS_NETPLAN_MAIN_FILE"
         chmod 600 "$DNS_NETPLAN_MAIN_FILE"
@@ -1168,7 +1133,6 @@ EOF
         fi
     fi
 
-    # 2. Apply to systemd-resolved (Drop-in + Runtime resolvectl)
     if [[ "$DNS_RUNTIME_BACKEND" == "systemd-resolved" ]]; then
         mkdir -p "$RESOLVED_DROPIN_DIR"
         cp -f "$tmp_dropin" "$RESOLVED_DROPIN_FILE"
@@ -1183,14 +1147,12 @@ EOF
         active_con="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v dev="$NET_PRIMARY_IFACE" '$2==dev {print $1; exit}')"
         if [[ -n "$active_con" ]]; then
             nmcli connection modify "$active_con" ipv4.dns "$dns_list" ipv4.ignore-auto-dns yes 2>/dev/null || ((apply_err++))
-            # Apply DNS without full SSH-breaking interface down/up
             nmcli device reapply "$NET_PRIMARY_IFACE" 2>/dev/null || true
         else
-            print_err "Could not identify active NetworkManager connection profile for ${NET_PRIMARY_IFACE}."
+            print_err "Could not identify active NetworkManager connection profile."
             ((apply_err++))
         fi
     elif [[ "$DNS_RUNTIME_BACKEND" == "static-resolv.conf" ]]; then
-        # Only modify /etc/resolv.conf if it is strictly verified as a static file not managed by a daemon
         {
             echo "# Generated by AKDNS System Manager"
             local ip
@@ -1203,7 +1165,6 @@ EOF
 
     rm -f "$tmp_dropin" "$tmp_netplan"
 
-    # Post-change verification
     sleep 1
     if (( apply_err == 0 )) && verify_dns_resolution; then
         print_ok "DNS successfully updated and verified ($dns_list)."
@@ -1259,7 +1220,6 @@ set_dns_manually() {
         fi
     fi
 
-    # Pre-check reachability of primary DNS
     if ! verify_dns_resolution "$dns1"; then
         print_warn "Primary DNS (${dns1}) did not respond to a test query right now."
         if ! confirm_action "Do you still want to force applying this unresponsive DNS?"; then
@@ -1288,12 +1248,11 @@ reset_dns_previous() {
 
 probe_payload_df() {
     local target="$1"
-    local proto="$2" # 4 or 6
+    local proto="$2"
     local payload="$3"
     local success=0
     local i
 
-    # Send 3 probes; require at least 2 replies to prevent transient packet loss from skewing MTU
     for i in 1 2 3; do
         if [[ "$proto" == "4" ]]; then
             if ping -4 -M do -s "$payload" -c 1 -W 1 "$target" >/dev/null 2>&1; then
@@ -1320,14 +1279,14 @@ detect_best_mtu() {
     [[ -z "$target_ip" ]] && target_ip="1.1.1.1"
 
     local proto=4
-    local header_size=28 # IPv4 (20B) + ICMP (8B)
+    local header_size=28
     local min_mtu=576
     local max_mtu=1500
 
     if is_valid_ipv6 "$target_ip"; then
         proto=6
-        header_size=48 # IPv6 (40B) + ICMPv6 (8B)
-        min_mtu=1280   # RFC 8200 minimum IPv6 MTU
+        header_size=48
+        min_mtu=1280
     elif ! is_valid_ipv4 "$target_ip"; then
         print_err "Invalid target IP address: ${target_ip}"
         return 1
@@ -1341,7 +1300,6 @@ detect_best_mtu() {
     local base_payload=$(( min_mtu - header_size ))
     if ! probe_payload_df "$target_ip" "$proto" "$base_payload"; then
         print_warn "Result: INCONCLUSIVE. Target ${target_ip} does not respond to baseline DF-ping (${min_mtu}B) or ICMP is blocked."
-        print_info "No MTU recommendation will be guessed when ICMP probing is blocked."
         return 1
     fi
 
@@ -1369,9 +1327,6 @@ detect_best_mtu() {
     printf "Header Overhead:             %d bytes (IP + ICMP)\n" "$header_size"
     printf "Max Unfragmented Payload:    %d bytes\n" "$best_payload"
     printf "Discovered Path MTU:         ${C_GREEN}%d${C_RESET} bytes\n" "$discovered_mtu"
-    printf "Tunnel/VPN Overhead Note:    If routing over WireGuard (-60 to -80B) or GRE/IPIP (-24 to -40B),\n"
-    printf "                             apply overhead reduction only to the tunnel interface, not physical WAN.\n"
-    printf "Measurement Limitation:      Reflects path to %s only; cannotexceed current local interface MTU (%s).\n" "$target_ip" "$NET_CURRENT_MTU"
     printf "${C_CYAN}=======================================================${C_RESET}\n"
     record_operation "Detect MTU (${discovered_mtu})" "SUCCESS"
     return 0
@@ -1401,7 +1356,7 @@ set_mtu_manually() {
     fi
 
     if (( new_mtu < 1280 )); then
-        print_warn "WARNING: Setting MTU below 1280 bytes will disable IPv6 according to RFC 8200!"
+        print_warn "WARNING: Setting MTU below 1280 bytes will disable IPv6!"
         confirm_action "Are you certain you want an MTU below 1280?" || return 1
     fi
 
@@ -1412,7 +1367,7 @@ set_mtu_manually() {
         return 1
     fi
 
-    check_Not_Dry_Run || return 0
+    check_not_dry_run || return 0
 
     local backup_path
     backup_path="$(create_backup "pre_mtu_${new_mtu}" | tail -n 1)"
@@ -1427,7 +1382,6 @@ set_mtu_manually() {
         return 1
     fi
 
-    # Health check after MTU change
     sleep 1
     local health_ok=1
     if [[ "$NET_GATEWAY" != "unknown" ]]; then
@@ -1436,7 +1390,7 @@ set_mtu_manually() {
     verify_dns_resolution || health_ok=0
 
     if [[ $health_ok -eq 0 ]]; then
-        print_err "Connectivity or DNS check failed after changing MTU! Rolling back immediately..."
+        print_err "Connectivity check failed after changing MTU! Rolling back immediately..."
         restore_backup "$backup_path"
         return 1
     fi
@@ -1468,8 +1422,6 @@ set_mtu_manually() {
             if [[ -n "$active_con" ]]; then
                 nmcli connection modify "$active_con" 802-3-ethernet.mtu "$new_mtu" 2>/dev/null || true
             fi
-        else
-            print_warn "Persistent backend (${DNS_PERSISTENT_BACKEND}) does not support automatic persistent MTU writing."
         fi
     fi
 
@@ -1486,15 +1438,11 @@ restore_mtu_previous() {
         print_err "No backup metadata available to restore MTU."
         return 1
     fi
-    local b_if b_mtu
-    b_if="$(awk -F'"' '/^PRIMARY_IFACE=/ {print $2}' "${latest_dir}/metadata.env")"
-    b_mtu="$(awk -F'"' '/^RUNTIME_MTU=/ {print $2}' "${latest_dir}/metadata.env")"
-    print_info "Restoring MTU on ${b_if} to ${b_mtu} from $(basename "$latest_dir")..."
     restore_backup "$latest_dir"
 }
 
 # ==============================================================================
-# Section 9: Diagnostics, Connectivity Tests & Configuration Diff
+# Section 9: Diagnostics, Connectivity Tests & Session Logs
 # ==============================================================================
 
 dns_connectivity_test() {
@@ -1514,13 +1462,15 @@ dns_connectivity_test() {
         local udp_st="FAIL" tcp_st="FAIL" res_st="FAIL" lat="N/A"
         local out_u out_t
         if command -v dig >/dev/null 2>&1; then
-            out_u="$(dig @"$srv" cloudflare.com A +notcp +time=2 +tries=1 2>/dev/null)"
+            out_u="$(dig @"$srv" cloudflare.com A +notcp +time=2 +tries=1 +noall +answer +comments +stats 2>/dev/null)"
             if grep -q "status: NOERROR" <<< "$out_u"; then
                 udp_st="OK"
                 res_st="OK"
-                lat="$(awk '/Query time:/ {print $(NF-1)" ms"; exit}' <<< "$out_u")"
+                if [[ "$out_u" =~ Query[[:space:]]+time:[[:space:]]*([0-9]+)[[:space:]]*msec ]]; then
+                    lat="${BASH_REMATCH[1]} ms"
+                fi
             fi
-            out_t="$(dig @"$srv" cloudflare.com A +tcp +time=2 +tries=1 2>/dev/null)"
+            out_t="$(dig @"$srv" cloudflare.com A +tcp +time=2 +tries=1 +noall +comments 2>/dev/null)"
             grep -q "status: NOERROR" <<< "$out_t" && tcp_st="OK"
         fi
         printf "%-18s %-12s %-12s %-15s %-10s\n" "$srv" "$udp_st" "$tcp_st" "$res_st" "$lat"
@@ -1544,7 +1494,7 @@ network_diagnostics() {
         echo "No IPv4 default gateway detected."
     fi
 
-    printf "\n${C_BOLD}4. Public WAN Reachability (1.1.1.1 & 8.8.8.8):${C_RESET}\n"
+    printf "\n${C_BOLD}4. Public WAN Reachability (1.1.1.1):${C_RESET}\n"
     ping -4 -c 3 -W 1 1.1.1.1 2>/dev/null || print_warn "1.1.1.1 unreachable via ICMP."
 
     printf "\n${C_BOLD}5. Resolver Status Summary:${C_RESET}\n"
@@ -1569,13 +1519,13 @@ show_configuration_diff() {
 }
 
 view_logs() {
-    printf "\n${C_CYAN}--- AKDNS Execution Logs (Last 50 Lines) ---${C_RESET}\n"
-    if [[ -f "$LOG_FILE" ]]; then
-        tail -n 50 "$LOG_FILE"
+    printf "\n${C_CYAN}--- AKDNS In-Memory Session Logs (Zero Disk Usage) ---${C_RESET}\n"
+    if (( ${#SESSION_LOGS[@]} > 0 )); then
+        printf "%s\n" "${SESSION_LOGS[@]}"
     else
-        print_info "Log file not created yet (${LOG_FILE})."
+        print_info "No events logged in current session yet."
     fi
-    printf "${C_CYAN}--------------------------------------------${C_RESET}\n"
+    printf "${C_CYAN}------------------------------------------------------${C_RESET}\n"
 }
 
 # ==============================================================================
@@ -1584,7 +1534,7 @@ view_logs() {
 
 show_menu() {
     printf "\n${C_BOLD}${C_CYAN}┌──────────────────────────────────────────────────────────┐${C_RESET}\n"
-    printf "${C_BOLD}${C_CYAN}│          AKDNS System Manager (${VERSION})          │${C_RESET}\n"
+    printf "${C_BOLD}${C_CYAN}│          AKDNS System Manager (${VERSION})             │${C_RESET}\n"
     printf "${C_BOLD}${C_CYAN}│      Ubuntu Server DNS & MTU Reliability Controller      │${C_RESET}\n"
     printf "${C_BOLD}${C_CYAN}└──────────────────────────────────────────────────────────┘${C_RESET}\n"
     [[ $DRY_RUN -eq 1 ]] && printf "  ${C_YELLOW}[MODE: DRY-RUN / READ-ONLY SIMULATION]${C_RESET}\n"
@@ -1603,7 +1553,7 @@ show_menu() {
     printf "  13. DNS Connectivity Test\n"
     printf "  14. Network Diagnostics\n"
     printf "  15. Show Configuration Diff\n"
-    printf "  16. View Logs\n"
+    printf "  16. View Session Logs (In-Memory)\n"
     printf "  17. Exit\n"
     printf "────────────────────────────────────────────────────────────\n"
 }
@@ -1637,7 +1587,7 @@ main_loop() {
             14) network_diagnostics ;;
             15) show_configuration_diff ;;
             16) view_logs ;;
-            17|q|exit) print_info "Exiting AKDNS System Manager. Stay reliable!"; exit 0 ;;
+            17|q|exit) print_info "Exiting AKDNS System Manager."; exit 0 ;;
             *)  print_warn "Invalid selection '${opt}'. Please enter a number between 1 and 17." ;;
         esac
     done
@@ -1655,7 +1605,6 @@ Options:
 EOF
 }
 
-# --- Entrypoint ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)    DRY_RUN=1; shift ;;
