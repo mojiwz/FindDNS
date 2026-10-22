@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Project: AKDNS System Manager (v2.2.0 - Zero-Disk-Bloat Edition)
+# Project: AKDNS System Manager (v2.2.1 - Zero-Disk-Bloat Edition)
 # Description: Enterprise-grade DNS & MTU Management, Benchmarking, and
 #              Diagnostics Tool for Ubuntu Server (20.04 / 22.04 / 24.04+)
 # Safety Rule: Strictly OS-level networking. Zero touch on Xray/Marzban configs.
@@ -10,8 +10,8 @@
 umask 0077
 export LC_ALL=C
 
-# --- Global Constants & Directories ---
-readonly VERSION="2.2.0-lean"
+# --- Global Constants & Directories (Prefixed with AKDNS_ to avoid OS collisions) ---
+readonly AKDNS_VERSION="2.2.1-lean"
 readonly SCRIPT_NAME="akdns-manager.sh"
 readonly BASE_DIR="/var/lib/akdns"
 readonly BACKUP_DIR="${BASE_DIR}/backups"
@@ -22,6 +22,7 @@ readonly MAX_BACKUPS=3
 
 # --- In-Memory Session Log (RAM Only - Zero Disk Usage) ---
 declare -a SESSION_LOGS=()
+LAST_CREATED_BACKUP_DIR=""
 
 # --- Runtime Flags ---
 DRY_RUN=0
@@ -95,7 +96,6 @@ init_storage() {
     if [[ $EUID -eq 0 ]]; then
         mkdir -p "$BACKUP_DIR" 2>/dev/null
         chmod 700 "$BASE_DIR" "$BACKUP_DIR" 2>/dev/null
-        # Clean up any legacy log/CSV directories from older script versions to free disk space
         if [[ -d "/var/log/akdns" ]]; then
             rm -rf "/var/log/akdns" 2>/dev/null
         fi
@@ -109,7 +109,6 @@ log_msg() {
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     SESSION_LOGS+=("[${ts}] [${level}] ${msg}")
-    # Keep RAM array capped at 100 entries
     if (( ${#SESSION_LOGS[@]} > 100 )); then
         SESSION_LOGS=("${SESSION_LOGS[@]:1}")
     fi
@@ -263,12 +262,13 @@ check_dependencies() {
 detect_system() {
     [[ $EUID -eq 0 ]] && SYS_IS_ROOT=1 || SYS_IS_ROOT=0
 
+    # Parse /etc/os-release safely in an isolated subshell to prevent variable collisions
     if [[ -f /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        source /etc/os-release
-        SYS_DISTRO_NAME="${NAME:-Ubuntu}"
-        SYS_DISTRO_VER="${VERSION_ID:-unknown}"
-        SYS_DISTRO_ID="${ID:-ubuntu}"
+        IFS='|' read -r SYS_DISTRO_NAME SYS_DISTRO_VER SYS_DISTRO_ID < <(
+            # shellcheck disable=SC1091
+            source /etc/os-release 2>/dev/null
+            printf "%s|%s|%s\n" "${NAME:-Ubuntu}" "${VERSION_ID:-unknown}" "${ID:-ubuntu}"
+        )
     fi
 
     if [[ -d /run/systemd/system ]]; then
@@ -542,6 +542,7 @@ show_system_status() {
 
 create_backup() {
     local op_reason="${1:-manual_backup}"
+    LAST_CREATED_BACKUP_DIR=""
     require_root || return 1
     detect_system
 
@@ -551,6 +552,7 @@ create_backup() {
 
     if ! check_not_dry_run; then
         print_info "[DRY-RUN] Would create backup in: ${target_dir}"
+        LAST_CREATED_BACKUP_DIR="$target_dir"
         return 0
     fi
 
@@ -584,12 +586,11 @@ PER_LINK_DNS="${DNS_PER_LINK}"
 EOF
     chmod 600 "${target_dir}/metadata.env"
 
-    # Automatically delete older backups beyond MAX_BACKUPS (3) to prevent disk usage growth
+    LAST_CREATED_BACKUP_DIR="$target_dir"
     prune_old_backups
 
     print_ok "Backup snapshot created: $(basename "$target_dir") (Auto-capped at ${MAX_BACKUPS} snapshots)"
     record_operation "Backup (${op_reason})" "SUCCESS"
-    echo "$target_dir"
     return 0
 }
 
@@ -676,8 +677,10 @@ compare_with_backup() {
 restore_backup() {
     require_root || return 1
     local target_dir="$1"
+    local interactive_mode=0
 
     if [[ -z "$target_dir" ]]; then
+        interactive_mode=1
         list_backups
         printf "Enter Backup ID to restore (or 0 to cancel): "
         local choice
@@ -698,9 +701,11 @@ restore_backup() {
         return 1
     fi
 
-    compare_with_backup "$target_dir"
-    if ! confirm_action "Restore configuration from $(basename "$target_dir")?"; then
-        return 1
+    if [[ $interactive_mode -eq 1 ]]; then
+        compare_with_backup "$target_dir"
+        if ! confirm_action "Restore configuration from $(basename "$target_dir")?"; then
+            return 1
+        fi
     fi
 
     check_not_dry_run || return 0
@@ -854,8 +859,6 @@ run_dns_benchmark() {
                     ((total_q++))
                     local dig_out=""
                     local dig_rc=0
-                    # CRITICAL FIX: '+noall' MUST come BEFORE '+answer +comments +stats'
-                    # Otherwise '+noall' wipes out the '+stats' section (Query time)!
                     dig_out="$(dig @"${ip1}" "$d" "$qtype" +tries="$retries" +time="$timeout_sec" +noall +answer +comments +stats 2>&1)" || dig_rc=$?
 
                     if [[ $dig_rc -eq 9 ]] || grep -qiE "connection timed out|communications error|network unreachable|no servers could be reached" <<< "$dig_out"; then
@@ -1112,8 +1115,9 @@ EOF
         return 0
     fi
 
-    local backup_path
-    backup_path="$(create_backup "pre_dns_change" | tail -n 1)"
+    # Call create_backup directly (no subshell stdout capture issues)
+    create_backup "pre_dns_change"
+    local backup_path="$LAST_CREATED_BACKUP_DIR"
     if [[ -z "$backup_path" || ! -d "$backup_path" ]]; then
         print_err "Mandatory backup failed! Aborting DNS modification."
         rm -f "$tmp_dropin" "$tmp_netplan"
@@ -1369,8 +1373,8 @@ set_mtu_manually() {
 
     check_not_dry_run || return 0
 
-    local backup_path
-    backup_path="$(create_backup "pre_mtu_${new_mtu}" | tail -n 1)"
+    create_backup "pre_mtu_${new_mtu}"
+    local backup_path="$LAST_CREATED_BACKUP_DIR"
     if [[ -z "$backup_path" || ! -d "$backup_path" ]]; then
         print_err "Backup failed! Aborting MTU change."
         return 1
@@ -1534,7 +1538,7 @@ view_logs() {
 
 show_menu() {
     printf "\n${C_BOLD}${C_CYAN}┌──────────────────────────────────────────────────────────┐${C_RESET}\n"
-    printf "${C_BOLD}${C_CYAN}│          AKDNS System Manager (${VERSION})             │${C_RESET}\n"
+    printf "${C_BOLD}${C_CYAN}│          AKDNS System Manager (${AKDNS_VERSION})             │${C_RESET}\n"
     printf "${C_BOLD}${C_CYAN}│      Ubuntu Server DNS & MTU Reliability Controller      │${C_RESET}\n"
     printf "${C_BOLD}${C_CYAN}└──────────────────────────────────────────────────────────┘${C_RESET}\n"
     [[ $DRY_RUN -eq 1 ]] && printf "  ${C_YELLOW}[MODE: DRY-RUN / READ-ONLY SIMULATION]${C_RESET}\n"
